@@ -868,20 +868,12 @@ function testSystemMessageRetrievalDoesNotPopulateCache() returns error? {
 final readonly & ai:ChatFunctionMessage K1FN = {role: "function", name: "lookupOrder", content: "{\"id\":\"ORD-1\"}"};
 
 // `PendingApproval` is not statically `anydata` (its `history`/`iterations` admit `Prompt` and
-// `Error`), so compare via the serialized JSON form, which captures every persisted field.
+// `Error`), so compare via the database-storable form, which captures every persisted field.
 function assertCheckpointEquals(ai:PendingApproval? actual, ai:PendingApproval expected) {
     if actual !is ai:PendingApproval {
         test:assertFail("expected a persisted checkpoint but found none");
     }
-    string|ai:Error actualJson = ai:serializePendingApproval(actual);
-    string|ai:Error expectedJson = ai:serializePendingApproval(expected);
-    if actualJson !is string {
-        test:assertFail("failed to serialize the actual checkpoint: " + actualJson.message());
-    }
-    if expectedJson !is string {
-        test:assertFail("failed to serialize the expected checkpoint: " + expectedJson.message());
-    }
-    test:assertEquals(actualJson, expectedJson);
+    test:assertEquals(toApprovalDatabaseMessage(actual), toApprovalDatabaseMessage(expected));
 }
 
 function assertNoCheckpoint(ai:PendingApproval? actual) {
