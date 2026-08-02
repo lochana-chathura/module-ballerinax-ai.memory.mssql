@@ -61,10 +61,10 @@ function dropTable() returns error? {
     }
 
     int checkpointTableExists = check cl->queryRow(
-        `SELECT IIF(OBJECT_ID('dbo.ChatMessagesCheckpoints', 'U') IS NOT NULL, 1, 0) AS TableExists;`);
+        `SELECT IIF(OBJECT_ID('dbo.Checkpoints', 'U') IS NOT NULL, 1, 0) AS TableExists;`);
 
     if checkpointTableExists == 1 {
-        _ = check cl->execute(`DROP TABLE dbo.ChatMessagesCheckpoints;`);
+        _ = check cl->execute(`DROP TABLE dbo.Checkpoints;`);
     }
 }
 
@@ -1062,4 +1062,69 @@ function testCheckpointWithPromptContent() returns error? {
     }
     test:assertEquals(content.strings, prompt.strings);
     test:assertEquals(content.insertions, prompt.insertions);
+}
+
+@test:Config {
+    before: dropTable
+}
+function testCheckpointTableNotCreatedOnInit() returns error? {
+    mssql:Client cl = getClient();
+    ShortTermMemoryStore _ = check new (cl);
+
+    int tableExists = check cl->queryRow(
+        `SELECT IIF(OBJECT_ID('dbo.Checkpoints', 'U') IS NOT NULL, 1, 0) AS TableExists;`);
+    test:assertEquals(tableExists, 0,
+            "Checkpoint table should not be created until a checkpoint operation is performed");
+}
+
+@test:Config {
+    before: dropTable
+}
+function testCustomCheckpointTableName() returns error? {
+    mssql:Client cl = getClient();
+    ShortTermMemoryStore store = check new (cl, checkpointTableName = "CustomCheckpoints");
+
+    ai:PendingApproval approval = buildPendingApproval(K1);
+    check store.putCheckpoint(approval);
+
+    int customTableExists = check cl->queryRow(
+        `SELECT IIF(OBJECT_ID('dbo.CustomCheckpoints', 'U') IS NOT NULL, 1, 0) AS TableExists;`);
+    test:assertEquals(customTableExists, 1, "Expected the custom checkpoint table to be created");
+
+    // The default-named table should not have been touched.
+    int defaultTableExists = check cl->queryRow(
+        `SELECT IIF(OBJECT_ID('dbo.Checkpoints', 'U') IS NOT NULL, 1, 0) AS TableExists;`);
+    test:assertEquals(defaultTableExists, 0, "Default-named checkpoint table should not have been created");
+
+    assertCheckpointEquals(check store.getCheckpoint(K1), approval);
+
+    // Clean up the custom table so it doesn't leak into other test runs.
+    _ = check cl->execute(`DROP TABLE dbo.CustomCheckpoints;`);
+}
+
+@test:Config {}
+function testInvalidCheckpointTableName() {
+    mssql:Client cl = getClient();
+    ShortTermMemoryStore|Error store = new (cl, checkpointTableName = "invalid-checkpoint-table-name");
+    if store !is Error {
+        test:assertFail("Expected an error for an invalid checkpoint table name");
+    }
+    test:assertTrue(store.message().includes("Invalid checkpoint table name"));
+}
+
+@test:Config {
+    before: dropTable
+}
+function testRemoveAllDoesNotCreateCheckpointTable() returns error? {
+    mssql:Client cl = getClient();
+    ShortTermMemoryStore store = check new (cl);
+
+    // No checkpoint was ever put for this key, so the checkpoint table should not exist yet.
+    check store.put(K1, K1SM1);
+    check store.removeAll(K1);
+
+    int tableExists = check cl->queryRow(
+        `SELECT IIF(OBJECT_ID('dbo.Checkpoints', 'U') IS NOT NULL, 1, 0) AS TableExists;`);
+    test:assertEquals(tableExists, 0,
+            "removeAll should not create the checkpoint table when it does not already exist");
 }
