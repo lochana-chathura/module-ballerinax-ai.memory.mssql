@@ -1112,6 +1112,20 @@ function testInvalidCheckpointTableName() {
     test:assertTrue(store.message().includes("Invalid checkpoint table name"));
 }
 
+@test:Config {}
+function testCheckpointTableNameCollidingWithMessagesTableRejected() {
+    mssql:Client cl = getClient();
+    // Without this check, `initializeDatabase()` creates the messages schema under this name
+    // eagerly at init, and `ensureCheckpointTable()`'s idempotent create then silently no-ops
+    // against it later - so every checkpoint operation would fail with a confusing SQL error
+    // (missing SessionId/ApprovalJson columns) instead of a clear error here.
+    ShortTermMemoryStore|Error store = new (cl, checkpointTableName = "ChatMessages");
+    if store !is Error {
+        test:assertFail("Expected an error when checkpointTableName collides with tableName");
+    }
+    test:assertTrue(store.message().includes("must be different from the chat messages table name"));
+}
+
 @test:Config {
     before: dropTable
 }
