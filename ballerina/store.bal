@@ -59,6 +59,13 @@ public isolated class ShortTermMemoryStore {
     private final cache:Cache? cache;
     private final int maxMessagesPerKey;
     private final string tableName;
+    // Table holding human-in-the-loop pause checkpoints, keyed by session ID. Created lazily on
+    // first use (see `ensureCheckpointTable`) rather than at initialization.
+    private final string checkpointTableName;
+    // Set once `ensureCheckpointTable` has confirmed the checkpoint table exists, so later
+    // checkpoint operations skip the create-if-not-exists round trip. Concurrent callers racing
+    // before this is set may each issue the idempotent statement once; that's harmless.
+    private boolean checkpointTableEnsured = false;
 
     # Initializes the MS SQL-backed short-term memory store.
     #
@@ -67,17 +74,32 @@ public isolated class ShortTermMemoryStore {
     # + cacheConfig - The cache configuration for in-memory caching of messages
     # + tableName - The name of the database table to store chat messages (default: "ChatMessages"). 
     # Must start with a letter or underscore and contain only letters, digits, and underscores.
+    # + checkpointTableName - The name of the database table to store human-in-the-loop pause
+    # checkpoints (default: "Checkpoints"), created lazily on first use rather than at
+    # initialization. Must start with a letter or underscore and contain only letters, digits, and
+    # underscores.
     # + returns - An error if the initialization fails
     public isolated function init(mssql:Client|DatabaseConfiguration mssqlClient,
             int maxMessagesPerKey = 20,
             cache:CacheConfig? cacheConfig = (),
-            string tableName = "ChatMessages") returns Error? {
+            string tableName = "ChatMessages",
+            string checkpointTableName = "Checkpoints") returns Error? {
         if !regexp:isFullMatch(re `^[A-Za-z_][A-Za-z0-9_]*$`, tableName) {
             return error(string `Invalid table name: '${tableName}'.`
                 + " Table name must start with a letter or underscore, "
                 + "and can only contain letters, digits, and underscores.");
         }
+        if !regexp:isFullMatch(re `^[A-Za-z_][A-Za-z0-9_]*$`, checkpointTableName) {
+            return error(string `Invalid checkpoint table name: '${checkpointTableName}'.`
+                + " Table name must start with a letter or underscore, "
+                + "and can only contain letters, digits, and underscores.");
+        }
+        if tableName == checkpointTableName {
+            return error(string `Invalid checkpoint table name: '${checkpointTableName}'.`
+                + " It must be different from the chat messages table name.");
+        }
         self.tableName = tableName;
+        self.checkpointTableName = checkpointTableName;
         if mssqlClient is mssql:Client {
             self.dbClient = mssqlClient;
         } else {
@@ -381,7 +403,9 @@ public isolated class ShortTermMemoryStore {
         }
     }
 
-    # Removes all stored chat messages for a given key.
+    # Removes all stored chat messages for a given key, including any pending human-in-the-loop
+    # approval checkpoint for that key, so clearing a session is atomic and an abandoned pause does
+    # not retain its whole history snapshot indefinitely.
     #
     # + key - The key associated with the memory
     # + return - nil on success, or an `Error` error if the operation fails
@@ -398,6 +422,27 @@ public isolated class ShortTermMemoryStore {
             return error("Failed to delete chat messages: " + result.message(), result);
         }
         self.removeCacheEntry(key);
+
+        // The checkpoint table is created lazily (see `ensureCheckpointTable`), so `removeAll` must
+        // not force it into existence just to delete a checkpoint that, if the table doesn't exist
+        // yet, cannot possibly be there.
+        boolean|Error checkpointTableExists = self.checkpointTableExists();
+        if checkpointTableExists is Error {
+            return checkpointTableExists;
+        }
+        if !checkpointTableExists {
+            return;
+        }
+        sql:ExecutionResult|sql:Error checkpointResult = self.dbClient->execute(
+            replaceTableNamePlaceholder(`
+                DELETE FROM $_tableName_$
+                WHERE SessionId = ${key}`,
+                self.checkpointTableName
+            )
+        );
+        if checkpointResult is sql:Error {
+            return error("Failed to delete pending approval: " + checkpointResult.message(), checkpointResult);
+        }
     }
 
     # Checks if the memory store is full for a given key.
@@ -437,8 +482,8 @@ public isolated class ShortTermMemoryStore {
 
         sql:ExecutionResult|sql:Error result = self.dbClient->execute(
             replaceTableNamePlaceholder(
-                `CREATE TABLE $_tableName_$ ( 
-                    Id INT IDENTITY(1,1) PRIMARY KEY, 
+                `CREATE TABLE $_tableName_$ (
+                    Id INT IDENTITY(1,1) PRIMARY KEY,
                     MessageKey NVARCHAR(100) NOT NULL, 
                     MessageRole NVARCHAR(20) NOT NULL CHECK (MessageRole IN ('user', 'system', 'assistant', 'function')), 
                     MessageJson NVARCHAR(MAX) NOT NULL, 
@@ -450,6 +495,51 @@ public isolated class ShortTermMemoryStore {
         if result is sql:Error {
             return error(string `Failed to create ${self.tableName} table: ${result.message()}`, result);
         }
+    }
+
+    // Creates the checkpoint table on first use rather than in `initializeDatabase`, so a store
+    // that never exercises human-in-the-loop checkpoints does not pay for a table it never touches.
+    // Skips the round trip entirely once `checkpointTableEnsured` is set; until then, the statement
+    // is idempotent (`IF OBJECT_ID(...) IS NULL`), so concurrent callers racing to create it is
+    // harmless.
+    private isolated function ensureCheckpointTable() returns Error? {
+        lock {
+            if self.checkpointTableEnsured {
+                return;
+            }
+        }
+
+        sql:ExecutionResult|sql:Error result = self.dbClient->execute(
+            replaceTableNamePlaceholder(
+                `IF OBJECT_ID('dbo.$_tableName_$', 'U') IS NULL
+                    CREATE TABLE $_tableName_$ (
+                        SessionId NVARCHAR(100) NOT NULL PRIMARY KEY,
+                        ApprovalJson NVARCHAR(MAX) NOT NULL,
+                        UpdatedAt DATETIME2 NOT NULL DEFAULT SYSDATETIME()
+                    );`,
+                self.checkpointTableName
+            )
+        );
+        if result is sql:Error {
+            return error(string `Failed to create ${self.checkpointTableName} table: ${result.message()}`, result);
+        }
+
+        lock {
+            self.checkpointTableEnsured = true;
+        }
+    }
+
+    private isolated function checkpointTableExists() returns boolean|Error {
+        int|sql:Error tableExists = self.dbClient->queryRow(
+            replaceTableNamePlaceholder(
+                `SELECT IIF(OBJECT_ID('dbo.$_tableName_$', 'U') IS NOT NULL, 1, 0) AS TableExists;`,
+                self.checkpointTableName
+            )
+        );
+        if tableExists is sql:Error {
+            return error("Failed to check for checkpoint table existence: " + tableExists.message(), tableExists);
+        }
+        return tableExists == 1;
     }
 
     private isolated function cacheFromDatabase(string key)
@@ -534,6 +624,102 @@ public isolated class ShortTermMemoryStore {
     # + return - The configured capacity of the message store per key
     public isolated function getCapacity() returns int {
         return self.maxMessagesPerKey;
+    }
+
+    # Stores (or replaces) the pending human-in-the-loop approval for its session.
+    #
+    # + approval - The pending approval to persist
+    # + return - nil on success, or an `Error` if the operation fails
+    public isolated function putCheckpoint(ai:PendingApproval approval) returns Error? {
+        check self.ensureCheckpointTable();
+        ApprovalDatabaseMessage dbMessage = toApprovalDatabaseMessage(approval);
+        string approvalJson = dbMessage.toJsonString();
+        sql:ExecutionResult|sql:Error result = self.dbClient->execute(
+            replaceTableNamePlaceholder(`
+                IF EXISTS (SELECT 1 FROM $_tableName_$ WHERE SessionId = ${approval.sessionId})
+                    UPDATE $_tableName_$
+                    SET ApprovalJson = ${approvalJson}, UpdatedAt = SYSDATETIME()
+                    WHERE SessionId = ${approval.sessionId}
+                ELSE
+                    INSERT INTO $_tableName_$ (SessionId, ApprovalJson)
+                    VALUES (${approval.sessionId}, ${approvalJson})`,
+                self.checkpointTableName
+            )
+        );
+        if result is sql:Error {
+            return error("Failed to store pending approval: " + result.message(), result);
+        }
+    }
+
+    # Returns the pending human-in-the-loop approval for a session, if any.
+    #
+    # + sessionId - The session to look up
+    # + return - The pending approval, nil if none is pending, or an `Error` if the operation fails
+    public isolated function getCheckpoint(string sessionId) returns ai:PendingApproval?|Error {
+        check self.ensureCheckpointTable();
+        CheckpointRecord|sql:Error checkpointRecord = self.dbClient->queryRow(
+            replaceTableNamePlaceholder(`
+                SELECT ApprovalJson FROM $_tableName_$ WHERE SessionId = ${sessionId}`,
+                self.checkpointTableName
+            )
+        );
+        if checkpointRecord is sql:NoRowsError {
+            return ();
+        }
+        if checkpointRecord is sql:Error {
+            return error("Failed to retrieve pending approval: " + checkpointRecord.message(), checkpointRecord);
+        }
+        ApprovalDatabaseMessage|error dbMessage = checkpointRecord.ApprovalJson.fromJsonStringWithType();
+        if dbMessage is error {
+            return error("Failed to parse pending approval from database: " + dbMessage.message(), dbMessage);
+        }
+        return fromApprovalDatabaseMessage(dbMessage);
+    }
+
+    # Removes the pending human-in-the-loop approval for a session, if any.
+    #
+    # + sessionId - The session to clear
+    # + return - nil on success, or an `Error` if the operation fails
+    public isolated function removeCheckpoint(string sessionId) returns Error? {
+        check self.ensureCheckpointTable();
+        sql:ExecutionResult|sql:Error result = self.dbClient->execute(
+            replaceTableNamePlaceholder(`
+                DELETE FROM $_tableName_$ WHERE SessionId = ${sessionId}`,
+                self.checkpointTableName
+            )
+        );
+        if result is sql:Error {
+            return error("Failed to remove pending approval: " + result.message(), result);
+        }
+    }
+
+    # Fetches and removes the pending human-in-the-loop approval for a session. The delete-and-return
+    # runs as a single statement so a concurrent duplicate resume for the same session cannot also
+    # claim and execute the same approved tool call.
+    #
+    # + sessionId - The session to claim
+    # + return - The claimed pending approval, nil if none was pending, or an `Error` if the operation fails
+    public isolated function takeCheckpoint(string sessionId) returns ai:PendingApproval?|Error {
+        check self.ensureCheckpointTable();
+        CheckpointRecord|sql:Error checkpointRecord = self.dbClient->queryRow(
+            replaceTableNamePlaceholder(`
+                DELETE FROM $_tableName_$
+                OUTPUT DELETED.ApprovalJson
+                WHERE SessionId = ${sessionId}`,
+                self.checkpointTableName
+            )
+        );
+        if checkpointRecord is sql:NoRowsError {
+            return ();
+        }
+        if checkpointRecord is sql:Error {
+            return error("Failed to claim pending approval: " + checkpointRecord.message(), checkpointRecord);
+        }
+        ApprovalDatabaseMessage|error dbMessage = checkpointRecord.ApprovalJson.fromJsonStringWithType();
+        if dbMessage is error {
+            return error("Failed to parse pending approval from database: " + dbMessage.message(), dbMessage);
+        }
+        return fromApprovalDatabaseMessage(dbMessage);
     }
 }
 

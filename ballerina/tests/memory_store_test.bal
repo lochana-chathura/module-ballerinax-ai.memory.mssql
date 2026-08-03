@@ -59,6 +59,13 @@ function dropTable() returns error? {
     if tableExists == 1 {
         _ = check cl->execute(`DROP TABLE dbo.ChatMessages;`);
     }
+
+    int checkpointTableExists = check cl->queryRow(
+        `SELECT IIF(OBJECT_ID('dbo.Checkpoints', 'U') IS NOT NULL, 1, 0) AS TableExists;`);
+
+    if checkpointTableExists == 1 {
+        _ = check cl->execute(`DROP TABLE dbo.Checkpoints;`);
+    }
 }
 
 @test:Config {
@@ -856,4 +863,282 @@ function testSystemMessageRetrievalDoesNotPopulateCache() returns error? {
 
     // Retrieve all messages - should load from database and include K1M3
     check assertAllMessages(store, K1, [K1SM1, K1M1, k1m2, K1M3]);
+}
+
+final readonly & ai:ChatFunctionMessage K1FN = {role: "function", name: "lookupOrder", content: "{\"id\":\"ORD-1\"}"};
+
+// `PendingApproval` is not statically `anydata` (its `history`/`iterations` admit `Prompt` and
+// `Error`), so compare via the database-storable form, which captures every persisted field.
+function assertCheckpointEquals(ai:PendingApproval? actual, ai:PendingApproval expected) {
+    if actual !is ai:PendingApproval {
+        test:assertFail("expected a persisted checkpoint but found none");
+    }
+    test:assertEquals(toApprovalDatabaseMessage(actual), toApprovalDatabaseMessage(expected));
+}
+
+function assertNoCheckpoint(ai:PendingApproval? actual) {
+    test:assertTrue(actual is (), "expected no persisted checkpoint");
+}
+
+// Builds a `PendingApproval` whose fields exercise every persisted concern: multi-kind history,
+// an iteration (with its own history and non-error outputs), tool calls, an approval request, an
+// undecided slot, and a response schema. Kept free of `Prompt` content and `Error` outputs so the
+// round trip is exactly value-equal (both are intentionally lossy and covered separately below).
+function buildPendingApproval(string sessionId) returns ai:PendingApproval {
+    ai:FunctionCall toolCall = {name: "issueRefund", arguments: {orderId: "ORD-1", amount: 20}, id: "call-1"};
+    ai:ApprovalRequest request = {
+        id: "req-1",
+        sessionId,
+        toolName: "issueRefund",
+        toolDescription: "Issues a refund for an order",
+        arguments: {orderId: "ORD-1", amount: 20},
+        toolCallId: "call-1",
+        batchIndex: 0
+    };
+    ai:Iteration iteration = {
+        history: [K1SM1, K1M1, k1m2],
+        output: [k1m2, K1FN],
+        startTime: [1700000000, 0.5d],
+        endTime: [1700000001, 0.25d]
+    };
+    return {
+        sessionId,
+        executionId: "exec-1",
+        iterationsUsed: 1,
+        history: [K1SM1, K1M1, k1m2, K1FN],
+        historyPrefixLength: 2,
+        iterations: [iteration],
+        toolCalls: [toolCall],
+        startTime: [1700000000, 0d],
+        originalBatch: [toolCall],
+        pendingRequests: [request],
+        decisions: [()]
+    };
+}
+
+@test:Config {
+    before: dropTable
+}
+function testCheckpointPersistAndRetrieve() returns error? {
+    mssql:Client cl = getClient();
+    ShortTermMemoryStore store = check new (cl);
+
+    // No checkpoint yet for an unknown session.
+    assertNoCheckpoint(check store.getCheckpoint(K1));
+
+    ai:PendingApproval approval = buildPendingApproval(K1);
+    check store.putCheckpoint(approval);
+
+    // getCheckpoint returns an equal value and leaves it in place.
+    assertCheckpointEquals(check store.getCheckpoint(K1), approval);
+    assertCheckpointEquals(check store.getCheckpoint(K1), approval);
+
+    // A checkpoint is scoped to its session.
+    assertNoCheckpoint(check store.getCheckpoint(K2));
+}
+
+@test:Config {
+    before: dropTable
+}
+function testCheckpointReplace() returns error? {
+    mssql:Client cl = getClient();
+    ShortTermMemoryStore store = check new (cl);
+
+    check store.putCheckpoint(buildPendingApproval(K1));
+
+    ai:PendingApproval updated = buildPendingApproval(K1);
+    updated.iterationsUsed = 5;
+    updated.decisions = [{decision: ai:APPROVE, reason: "looks good"}];
+    check store.putCheckpoint(updated);
+
+    // The second put replaces the first rather than adding a duplicate row.
+    assertCheckpointEquals(check store.getCheckpoint(K1), updated);
+}
+
+@test:Config {
+    before: dropTable
+}
+function testTakeCheckpointClaimsAtomically() returns error? {
+    mssql:Client cl = getClient();
+    ShortTermMemoryStore store = check new (cl);
+
+    ai:PendingApproval approval = buildPendingApproval(K1);
+    check store.putCheckpoint(approval);
+
+    // The first take returns the checkpoint and removes it.
+    assertCheckpointEquals(check store.takeCheckpoint(K1), approval);
+    // A second take (e.g. a duplicate resume) finds nothing to claim.
+    assertNoCheckpoint(check store.takeCheckpoint(K1));
+    assertNoCheckpoint(check store.getCheckpoint(K1));
+}
+
+@test:Config {
+    before: dropTable
+}
+function testRemoveCheckpoint() returns error? {
+    mssql:Client cl = getClient();
+    ShortTermMemoryStore store = check new (cl);
+
+    check store.putCheckpoint(buildPendingApproval(K1));
+    check store.removeCheckpoint(K1);
+    assertNoCheckpoint(check store.getCheckpoint(K1));
+
+    // Removing a non-existent checkpoint is a no-op, not an error.
+    check store.removeCheckpoint(K2);
+}
+
+@test:Config {
+    before: dropTable
+}
+function testCheckpointClearedOnRemoveAll() returns error? {
+    mssql:Client cl = getClient();
+    ShortTermMemoryStore store = check new (cl);
+
+    check store.put(K1, K1M1);
+    check store.putCheckpoint(buildPendingApproval(K1));
+
+    check store.removeAll(K1);
+
+    // removeAll drops both the messages and the pending checkpoint for the session.
+    check assertAllMessages(store, K1, []);
+    assertNoCheckpoint(check store.getCheckpoint(K1));
+}
+
+@test:Config {
+    before: dropTable
+}
+function testCheckpointErrorOutputStringified() returns error? {
+    mssql:Client cl = getClient();
+    ShortTermMemoryStore store = check new (cl);
+
+    ai:PendingApproval approval = buildPendingApproval(K1);
+    approval.iterations = [
+        {
+            history: [K1M1],
+            output: [error ai:Error("tool failed", error("connection reset"))],
+            startTime: [1700000000, 0d],
+            endTime: [1700000001, 0d]
+        }
+    ];
+    check store.putCheckpoint(approval);
+
+    ai:PendingApproval? retrieved = check store.getCheckpoint(K1);
+    if retrieved !is ai:PendingApproval {
+        test:assertFail("expected a persisted checkpoint");
+    }
+    var output = retrieved.iterations[0].output[0];
+    if output !is ai:Error {
+        test:assertFail("expected the error output to round-trip as an ai:Error");
+    }
+    test:assertEquals(output.message(), "tool failed (cause: connection reset)");
+}
+
+@test:Config {
+    before: dropTable
+}
+function testCheckpointWithPromptContent() returns error? {
+    mssql:Client cl = getClient();
+    ShortTermMemoryStore store = check new (cl);
+
+    string city = "Seattle";
+    ai:Prompt prompt = `What is the weather in ${city}?`;
+    ai:ChatUserMessage userMessage = {role: ai:USER, content: prompt};
+
+    ai:PendingApproval approval = buildPendingApproval(K1);
+    approval.history = [userMessage];
+    check store.putCheckpoint(approval);
+
+    ai:PendingApproval? retrieved = check store.getCheckpoint(K1);
+    if retrieved !is ai:PendingApproval {
+        test:assertFail("expected a persisted checkpoint");
+    }
+    var restored = retrieved.history[0];
+    if restored !is ai:ChatUserMessage {
+        test:assertFail("expected a user message");
+    }
+    ai:Prompt|string content = restored.content;
+    if content !is ai:Prompt {
+        test:assertFail("expected the prompt content to round-trip as a Prompt");
+    }
+    test:assertEquals(content.strings, prompt.strings);
+    test:assertEquals(content.insertions, prompt.insertions);
+}
+
+@test:Config {
+    before: dropTable
+}
+function testCheckpointTableNotCreatedOnInit() returns error? {
+    mssql:Client cl = getClient();
+    ShortTermMemoryStore _ = check new (cl);
+
+    int tableExists = check cl->queryRow(
+        `SELECT IIF(OBJECT_ID('dbo.Checkpoints', 'U') IS NOT NULL, 1, 0) AS TableExists;`);
+    test:assertEquals(tableExists, 0,
+            "Checkpoint table should not be created until a checkpoint operation is performed");
+}
+
+@test:Config {
+    before: dropTable
+}
+function testCustomCheckpointTableName() returns error? {
+    mssql:Client cl = getClient();
+    ShortTermMemoryStore store = check new (cl, checkpointTableName = "CustomCheckpoints");
+
+    ai:PendingApproval approval = buildPendingApproval(K1);
+    check store.putCheckpoint(approval);
+
+    int customTableExists = check cl->queryRow(
+        `SELECT IIF(OBJECT_ID('dbo.CustomCheckpoints', 'U') IS NOT NULL, 1, 0) AS TableExists;`);
+    test:assertEquals(customTableExists, 1, "Expected the custom checkpoint table to be created");
+
+    // The default-named table should not have been touched.
+    int defaultTableExists = check cl->queryRow(
+        `SELECT IIF(OBJECT_ID('dbo.Checkpoints', 'U') IS NOT NULL, 1, 0) AS TableExists;`);
+    test:assertEquals(defaultTableExists, 0, "Default-named checkpoint table should not have been created");
+
+    assertCheckpointEquals(check store.getCheckpoint(K1), approval);
+
+    // Clean up the custom table so it doesn't leak into other test runs.
+    _ = check cl->execute(`DROP TABLE dbo.CustomCheckpoints;`);
+}
+
+@test:Config {}
+function testInvalidCheckpointTableName() {
+    mssql:Client cl = getClient();
+    ShortTermMemoryStore|Error store = new (cl, checkpointTableName = "invalid-checkpoint-table-name");
+    if store !is Error {
+        test:assertFail("Expected an error for an invalid checkpoint table name");
+    }
+    test:assertTrue(store.message().includes("Invalid checkpoint table name"));
+}
+
+@test:Config {}
+function testCheckpointTableNameCollidingWithMessagesTableRejected() {
+    mssql:Client cl = getClient();
+    // Without this check, `initializeDatabase()` creates the messages schema under this name
+    // eagerly at init, and `ensureCheckpointTable()`'s idempotent create then silently no-ops
+    // against it later - so every checkpoint operation would fail with a confusing SQL error
+    // (missing SessionId/ApprovalJson columns) instead of a clear error here.
+    ShortTermMemoryStore|Error store = new (cl, checkpointTableName = "ChatMessages");
+    if store !is Error {
+        test:assertFail("Expected an error when checkpointTableName collides with tableName");
+    }
+    test:assertTrue(store.message().includes("must be different from the chat messages table name"));
+}
+
+@test:Config {
+    before: dropTable
+}
+function testRemoveAllDoesNotCreateCheckpointTable() returns error? {
+    mssql:Client cl = getClient();
+    ShortTermMemoryStore store = check new (cl);
+
+    // No checkpoint was ever put for this key, so the checkpoint table should not exist yet.
+    check store.put(K1, K1SM1);
+    check store.removeAll(K1);
+
+    int tableExists = check cl->queryRow(
+        `SELECT IIF(OBJECT_ID('dbo.Checkpoints', 'U') IS NOT NULL, 1, 0) AS TableExists;`);
+    test:assertEquals(tableExists, 0,
+            "removeAll should not create the checkpoint table when it does not already exist");
 }
