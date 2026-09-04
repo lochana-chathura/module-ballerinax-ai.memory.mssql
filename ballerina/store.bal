@@ -67,23 +67,18 @@ public isolated class ShortTermMemoryStore {
 
     # Initializes the MS SQL-backed short-term memory store.
     #
+    # Note: Creating the chat messages table and (if using human-in-the-loop) the checkpoint table
+    # is a pre-requisite. See the [documentation](https://central.ballerina.io/ballerinax/ai.memory.mssql/latest)
+    # for the required schemas.
+    #
     # + mssqlClient - The MS SQL client or database configuration to connect to the database
     # + maxMessagesPerKey - The maximum number of interactive messages to store per key
     # + cacheConfig - The cache configuration for in-memory caching of messages
-    # + tableName - The name of the database table to store chat messages (default: "ChatMessages"). 
-    # Must start with a letter or underscore and contain only letters, digits, and underscores.
+    # + tableName - The name of the database table to store chat messages. Create this table
+    # before use. Must start with a letter or underscore and contain only letters, digits, and underscores
     # + checkpointTableName - The name of the database table holding human-in-the-loop pause
-    # checkpoints (default: "Checkpoints"). This table is **not** created by the store; provision it
-    # before using human-in-the-loop, with the schema:
-    # ```sql
-    # CREATE TABLE Checkpoints (
-    #     SessionId NVARCHAR(100) NOT NULL PRIMARY KEY,
-    #     ApprovalJson NVARCHAR(MAX) NOT NULL,
-    #     UpdatedAt DATETIME2 NOT NULL DEFAULT SYSDATETIME()
-    # );
-    # ```
-    # A deployment that does not use human-in-the-loop does not need it at all. Must start with a
-    # letter or underscore and contain only letters, digits, and underscores.
+    # checkpoints. Create this table before using human-in-the-loop. Must start with a letter or
+    # underscore and contain only letters, digits, and underscores
     # + returns - An error if the initialization fails
     public isolated function init(mssql:Client|DatabaseConfiguration mssqlClient,
             int maxMessagesPerKey = 20,
